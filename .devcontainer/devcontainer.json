@@ -1,0 +1,15 @@
+{
+  "name": "Bazaar",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "openai.chatgpt",
+        "anthropic.claude-code"
+      ]
+    }
+  },
+  "forwardPorts": [3001]
+}
