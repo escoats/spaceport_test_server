@@ -6,12 +6,13 @@ import asyncio
 import json
 import logging
 import secrets
-from contextlib import suppress
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 LOG = logging.getLogger(__name__)
 RESOURCES = ("water", "food", "components")
@@ -127,29 +128,164 @@ class Offer:
     created_tick: int = 0; created_version: int = 1; transaction_id: str | None = None; closed_tick: int | None = None; settled_tick: int | None = None; settled_version: int | None = None
 
 
+@dataclass(frozen=True)
+class DeliveryLimits:
+    max_pending_messages: int = 64
+    max_pending_bytes: int = 8 * 1024 * 1024
+    send_timeout: float = 5.0
+    close_timeout: float = 2.0
+
+    def __post_init__(self) -> None:
+        if min(self.max_pending_messages, self.max_pending_bytes, self.send_timeout, self.close_timeout) <= 0:
+            raise ValueError("Delivery limits and timeouts must be positive")
+
+
+class ClientSession:
+    """One ordered writer; world operations never await network delivery."""
+
+    def __init__(self, world: "DemoBazaar", station_id: str, socket: ServerConnection) -> None:
+        self.world, self.station_id, self.socket = world, station_id, socket
+        self.pending: deque[tuple[bytes, bool]] = deque()
+        self.pending_bytes = 0
+        self.snapshot_sequence = 0
+        self.closed = False
+        self._available = asyncio.Event()
+        self._send_task: asyncio.Task | None = None
+        self.sender_task = world._track_task(self._write(), f"sender:{station_id}")
+        self.cleanup_task: asyncio.Task | None = None
+
+    def enqueue(self, message: Any) -> None:
+        if self.closed:
+            return
+        is_state = message.WhichOneof("message") == "state"
+        # Store immutable bytes now, including the world revision at enqueue time.
+        # The connection-local sequence is assigned only when actually sent.
+        if is_state:
+            message.state.snapshot_sequence = 0
+        payload = message.SerializeToString()
+        if is_state and self.pending and self.pending[-1][1]:
+            old_payload, _ = self.pending.pop()
+            self.pending_bytes -= len(old_payload)
+        limits = self.world.delivery_limits
+        if len(self.pending) >= limits.max_pending_messages or self.pending_bytes + len(payload) > limits.max_pending_bytes:
+            self.close(1013, "outbound queue limit exceeded")
+            return
+        self.pending.append((payload, is_state))
+        self.pending_bytes += len(payload)
+        self._available.set()
+
+    async def _write(self) -> None:
+        try:
+            while not self.closed:
+                await self._available.wait()
+                if self.closed:
+                    return
+                payload, is_state = self.pending.popleft()
+                self.pending_bytes -= len(payload)
+                if not self.pending:
+                    self._available.clear()
+                if is_state:
+                    message = self.world.pb.ServerMessage.FromString(payload)
+                    self.snapshot_sequence += 1
+                    message.state.snapshot_sequence = self.snapshot_sequence
+                    payload = message.SerializeToString()
+                self._send_task = self.world._track_task(self.socket.send(payload), f"send:{self.station_id}")
+                done, _ = await asyncio.wait({self._send_task}, timeout=self.world.delivery_limits.send_timeout)
+                if not done:
+                    self.close(1013, "outbound send timed out")
+                    return
+                await self._send_task
+                self._send_task = None
+        except (ConnectionClosed, OSError):
+            self.close(1011, "outbound transport failed")
+        except Exception:
+            # Do not include transport exception text, which may contain peer data.
+            self.close(1011, "outbound sender failed")
+
+    def close(self, code: int = 1000, reason: str = "connection closed") -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.pending.clear()
+        self.pending_bytes = 0
+        self.world._remove_session(self)
+        LOG.info("Station %s disconnected: %s", self.station_id, reason)
+        self.cleanup_task = self.world._track_task(self._cleanup(code, reason), f"cleanup:{self.station_id}")
+
+    async def _cleanup(self, code: int, reason: str) -> None:
+        try:
+            # Start and bound closure before cancelling a send blocked on backpressure.
+            await asyncio.wait_for(self.socket.close(code=code, reason=reason), self.world.delivery_limits.close_timeout)
+        except (TimeoutError, ConnectionClosed, OSError):
+            pass
+        except Exception as error:
+            LOG.warning("Station %s close failed (%s)", self.station_id, type(error).__name__)
+        finally:
+            tasks = [self.sender_task]
+            if self._send_task is not None:
+                tasks.append(self._send_task)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class DemoBazaar:
-    def __init__(self, scenario: Scenario) -> None:
+    def __init__(self, scenario: Scenario, *, delivery_limits: DeliveryLimits | None = None) -> None:
         self.scenario, self.pb = scenario, protobuf_module()
         self.run_id, self.tick, self.world_version, self.phase = f"demo-{secrets.token_hex(6)}", 0, 1, "READY"
         self.stations = {spec.station_id: Station(spec, secrets.token_urlsafe(24), health=scenario.economy.max_health, inventory=dict(spec.inventory)) for spec in scenario.stations}
-        self.offers: list[Offer] = []; self.connections: dict[str, ServerConnection] = {}; self.snapshot_sequences: dict[str, int] = {}
-        self._offer_sequence = self._transaction_sequence = 0; self._lock = asyncio.Lock(); self._ready_to_run = asyncio.Event(); self.finished = asyncio.Event()
+        self.offers: list[Offer] = []
+        self.connections: dict[str, ClientSession] = {}
+        self.delivery_limits = delivery_limits or DeliveryLimits()
+        self._session_tasks: set[asyncio.Task] = set()
+        self._closing = False
+        self._offer_sequence = self._transaction_sequence = 0; self._ready_to_run = asyncio.Event(); self.finished = asyncio.Event()
 
     def credentials(self) -> dict[str, list[dict[str, str]]]:
         return {"players": [{"station_id": item.spec.station_id, "token": item.token} for item in self.stations.values()]}
 
-    async def attach(self, station_id: str, socket: ServerConnection) -> None:
-        previous = self.connections.get(station_id); self.connections[station_id] = socket; self.snapshot_sequences[station_id] = 0
-        if previous is not None and previous is not socket: await previous.close(code=4001, reason="station reconnected")
-        await self._send_state(station_id, socket)
+    def _track_task(self, coroutine: Any, name: str) -> asyncio.Task:
+        task = asyncio.create_task(coroutine, name=name)
+        self._session_tasks.add(task)
+        task.add_done_callback(self._session_tasks.discard)
+        return task
+
+    def _remove_session(self, session: ClientSession) -> None:
+        if self.connections.get(session.station_id) is session:
+            self.connections.pop(session.station_id)
+            self.stations[session.station_id].ready = False
+
+    async def attach(self, station_id: str, socket: ServerConnection) -> ClientSession:
+        previous = self.connections.get(station_id)
+        session = ClientSession(self, station_id, socket)
+        self.connections[station_id] = session
+        self.stations[station_id].ready = False
+        if previous is not None:
+            previous.close(4001, "station reconnected")
+        if self._closing:
+            session.close(1001, "server shutting down")
+        else:
+            await self._send_state(station_id)
+        return session
 
     async def detach(self, station_id: str, socket: ServerConnection) -> None:
-        if self.connections.get(station_id) is socket: self.connections.pop(station_id, None); self.snapshot_sequences.pop(station_id, None)
+        session = self.connections.get(station_id)
+        if session is not None and session.socket is socket:
+            session.close()
+
+    async def close(self) -> None:
+        self._closing = True
+        for session in tuple(self.connections.values()):
+            session.close(1001, "server shutting down")
+        while self._session_tasks:
+            await asyncio.gather(*tuple(self._session_tasks), return_exceptions=True)
 
     def _can_trade(self, station_id: str, command: Any) -> bool:
         return self.phase == "RUNNING" and command.protocol_version == PROTOCOL_VERSION and command.run_id == self.run_id and self.stations[station_id].ready and not self.stations[station_id].failed_once
 
-    async def handle(self, station_id: str, message: Any) -> None:
+    async def handle(self, station_id: str, message: Any, *, session: ClientSession | None = None) -> None:
+        if session is not None and (session.closed or self.connections.get(station_id) is not session):
+            return
         kind = message.WhichOneof("message")
         if kind == "ready": await self._ready(station_id, message.ready)
         elif kind == "sync": await self._send_state(station_id)
@@ -222,8 +358,13 @@ class DemoBazaar:
         else: station.fully_supplied_ticks += 1; station.current_shortage_streak = 0; station.health = min(self.scenario.economy.max_health, station.health + self.scenario.economy.recovery_per_fully_supplied_tick)
 
     async def broadcast_state(self) -> None:
-        for station_id, socket in tuple(self.connections.items()): await self._send_state(station_id, socket)
-    async def _send_state(self, station_id: str, socket: ServerConnection | None = None) -> None: await self._send(station_id, self._state(station_id), socket)
+        # Enqueue the entire broadcast without yielding to socket I/O.
+        for station_id in tuple(self.connections):
+            await self._send_state(station_id)
+
+    async def _send_state(self, station_id: str) -> None:
+        await self._send(station_id, self._state(station_id))
+
     def _copy_bundle(self, source: dict[str, int], target: Any) -> None:
         for name, amount in source.items(): setattr(target, name, amount)
     def _state(self, station_id: str) -> Any:
@@ -244,11 +385,10 @@ class DemoBazaar:
         message = self.pb.ServerMessage(); result = message.result; result.type = self.pb.RESULT_TYPE_RESULT; result.protocol_version = PROTOCOL_VERSION; result.run_id = self.run_id; result.request_id = request_id; result.ok = ok; result.code = getattr(self.pb, code); result.processed_tick = self.tick; result.processed_version = self.world_version; (setattr(result.object_id, "value", object_id) if object_id else setattr(result.object_id, "null", True)); (setattr(result.transaction_id, "value", transaction_id) if transaction_id else setattr(result.transaction_id, "null", True)); result.retry_after_tick.null = True; await self._send(station_id, message)
     async def _protocol_error(self, station_id: str) -> None:
         message = self.pb.ServerMessage(); error = message.protocol_error; error.type = self.pb.PROTOCOL_ERROR_TYPE_PROTOCOL_ERROR; error.protocol_version = PROTOCOL_VERSION; error.run_id.value = self.run_id; error.request_id.null = True; error.code = self.pb.CONTROL_CODE_BAD_MESSAGE; error.close_session = False; await self._send(station_id, message)
-    async def _send(self, station_id: str, message: Any, socket: ServerConnection | None = None) -> None:
-        socket = socket or self.connections.get(station_id)
-        if socket is None: return
-        if message.WhichOneof("message") == "state": self.snapshot_sequences[station_id] = self.snapshot_sequences.get(station_id, 0) + 1; message.state.snapshot_sequence = self.snapshot_sequences[station_id]
-        await socket.send(message.SerializeToString())
+    async def _send(self, station_id: str, message: Any) -> None:
+        session = self.connections.get(station_id)
+        if session is not None:
+            session.enqueue(message)
 
 
 class DemoBazaarServer:
@@ -256,23 +396,49 @@ class DemoBazaarServer:
     async def handler(self, socket: ServerConnection) -> None:
         auth = socket.request.headers.get("Authorization", ""); token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""; station_id = next((item.spec.station_id for item in self.world.stations.values() if secrets.compare_digest(item.token, token)), None)
         if socket.subprotocol != SUBPROTOCOL or station_id is None: await socket.close(code=1008, reason="valid Bazaar credentials and subprotocol required"); return
-        await self.world.attach(station_id, socket)
         try:
+            session = await self.world.attach(station_id, socket)
             async for raw in socket:
+                if session.closed or self.world.connections.get(station_id) is not session:
+                    break
                 message = self.world.pb.ClientMessage()
                 if not isinstance(raw, bytes): await self.world._protocol_error(station_id); continue
                 try: message.ParseFromString(raw)
                 except Exception: await self.world._protocol_error(station_id); continue
                 if not message.IsInitialized(): await self.world._protocol_error(station_id); continue
-                await self.world.handle(station_id, message)
-        finally: await self.world.detach(station_id, socket)
+                await self.world.handle(station_id, message, session=session)
+        except ConnectionClosed:
+            pass
+        finally:
+            await self.world.detach(station_id, socket)
+
+
+async def supervise_ticks(world: DemoBazaar) -> None:
+    tick_task = asyncio.create_task(world.run_ticks(), name="world-ticks")
+    try:
+        await tick_task
+        # Normal completion retains the final world for reconnects and sync.
+        await asyncio.get_running_loop().create_future()
+    except Exception:
+        LOG.exception("World tick task failed; shutting down server")
+        raise
+    finally:
+        tick_task.cancel()
+        await asyncio.gather(tick_task, return_exceptions=True)
 
 
 async def run(host: str, port: int, credential_file: Path, scenario: Scenario) -> None:
-    world = DemoBazaar(scenario); credential_file.write_text(json.dumps(world.credentials(), indent=2) + "\n"); tick_task = asyncio.create_task(world.run_ticks())
+    world = DemoBazaar(scenario)
+    credential_file.write_text(json.dumps(world.credentials(), indent=2) + "\n")
     try:
-        async with serve(DemoBazaarServer(world).handler, host, port, subprotocols=[SUBPROTOCOL], max_size=2**20): await asyncio.get_running_loop().create_future()
-    finally: tick_task.cancel();
+        async with serve(DemoBazaarServer(world).handler, host, port, subprotocols=[SUBPROTOCOL],
+                         max_size=2**20, close_timeout=world.delivery_limits.close_timeout):
+            try:
+                await supervise_ticks(world)
+            finally:
+                await world.close()
+    finally:
+        await world.close()
 
 
 def main() -> None:
