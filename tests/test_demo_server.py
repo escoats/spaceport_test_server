@@ -32,6 +32,61 @@ def test_scenario_loads_and_issues_distinct_station_credentials(tmp_path):
     players = world.credentials()["players"]
     assert [player["station_id"] for player in players] == ["P01", "P02"]
     assert len({player["token"] for player in players}) == 2
+    assert world.minimum_ready_stations == 2
+
+
+def test_minimum_ready_stations_override_replaces_scenario_value(tmp_path):
+    path = scenario_file(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["minimum_ready_stations"] = 2
+    raw["stations"].append({
+        "id": "P03", "specialty": "components",
+        "inventory": {"water": 4, "food": 4, "components": 12},
+    })
+    path.write_text(json.dumps(raw))
+
+    scenario = Scenario.from_file(path, minimum_ready_stations=1)
+    assert scenario.minimum_ready_stations == 1
+
+
+@pytest.mark.parametrize("value", [0, -1, 4, True, 1.5])
+def test_minimum_ready_stations_override_must_be_valid(tmp_path, value):
+    with pytest.raises(ValueError, match="minimum_ready_stations"):
+        Scenario.from_file(scenario_file(tmp_path), minimum_ready_stations=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "2", 3])
+def test_minimum_ready_stations_must_be_valid(tmp_path, value):
+    path = scenario_file(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["minimum_ready_stations"] = value
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ValueError, match="minimum_ready_stations"):
+        Scenario.from_file(path)
+
+
+@pytest.mark.asyncio
+async def test_partial_readiness_starts_after_configured_number_of_stations(tmp_path):
+    path = scenario_file(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["minimum_ready_stations"] = 2
+    raw["stations"].append({
+        "id": "P03", "specialty": "components",
+        "inventory": {"water": 4, "food": 4, "components": 12},
+    })
+    path.write_text(json.dumps(raw))
+    world = DemoBazaar(Scenario.from_file(path))
+
+    async def discard_send(*args):
+        return None
+
+    world._send = discard_send
+    await world._ready("P03", ready_message(world).ready)
+    assert world.phase == "READY"
+    await world._ready("P01", ready_message(world).ready)
+    assert world.phase == "RUNNING"
+    assert world.world_version == 2
 
 
 @pytest.mark.asyncio

@@ -63,9 +63,10 @@ class Scenario:
     economy: Economy
     duration_ticks: int = 30
     tick_duration_ms: int = 1_000
+    minimum_ready_stations: int | None = None
 
     @classmethod
-    def from_file(cls, path: Path) -> "Scenario":
+    def from_file(cls, path: Path, *, minimum_ready_stations: int | None = None) -> "Scenario":
         try:
             raw = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as error:
@@ -98,10 +99,16 @@ class Scenario:
             stations.append(StationSpec(item["id"], specialty, bundle(item.get("inventory", {}), f"station {item['id']} inventory")))
         if len({station.station_id for station in stations}) != len(stations):
             raise ValueError("Station IDs must be unique")
+        configured_minimum = raw.get("minimum_ready_stations", len(stations))
+        if minimum_ready_stations is not None:
+            configured_minimum = minimum_ready_stations
+        if (not isinstance(configured_minimum, int) or isinstance(configured_minimum, bool)
+            or not 1 <= configured_minimum <= len(stations)):
+            raise ValueError("minimum_ready_stations must be an integer between 1 and the number of stations")
         duration, interval = raw.get("duration_ticks", 30), raw.get("tick_duration_ms", 1_000)
         if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in (duration, interval)):
             raise ValueError("duration_ticks and tick_duration_ms must be positive integers")
-        return cls(tuple(stations), economy, duration, interval)
+        return cls(tuple(stations), economy, duration, interval, configured_minimum)
 
 
 @dataclass
@@ -244,6 +251,7 @@ class DemoBazaar:
         self.advertisements: list[Any] = []
         self._advertisement_sequence = 0
         self.connections: dict[str, ClientSession] = {}
+        self.minimum_ready_stations = scenario.minimum_ready_stations or len(self.stations)
         self.delivery_limits = delivery_limits or DeliveryLimits()
         self._session_tasks: set[asyncio.Task] = set()
         self._closing = False
@@ -347,7 +355,7 @@ class DemoBazaar:
 
     async def _ready(self, station_id: str, command: Any) -> None:
         if command.run_id != self.run_id: await self._protocol_error(station_id); return
-        self.stations[station_id].ready = bool(command.ready); starts = self.phase == "READY" and all(item.ready for item in self.stations.values())
+        self.stations[station_id].ready = bool(command.ready); starts = self.phase == "READY" and sum(item.ready for item in self.stations.values()) >= self.minimum_ready_stations
         if starts: self.phase = "RUNNING"; self.world_version += 1; self._ready_to_run.set()
         message = self.pb.ServerMessage(); message.readiness.type = self.pb.READINESS_TYPE_READINESS; message.readiness.protocol_version = PROTOCOL_VERSION; message.readiness.run_id = self.run_id; message.readiness.ready = self.stations[station_id].ready; message.readiness.snapshot_sequence = command.snapshot_sequence
         await self._send(station_id, message)
@@ -576,8 +584,8 @@ async def run(host: str, port: int, credential_file: Path, scenario: Scenario) -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--scenario", type=Path, default=Path("scenarios/default.json")); parser.add_argument("--host", default="127.0.0.1"); parser.add_argument("--port", type=int, default=3001); parser.add_argument("--credential-file", type=Path, default=Path("demo-credentials.json")); parser.add_argument("--verbose", action="store_true"); args = parser.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
-    try: asyncio.run(run(args.host, args.port, args.credential_file, Scenario.from_file(args.scenario)))
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--scenario", type=Path, default=Path("scenarios/default.json")); parser.add_argument("--host", default="0.0.0.0"); parser.add_argument("--port", type=int, default=3001); parser.add_argument("--credential-file", type=Path, default=Path("hivemind-credentials.json")); parser.add_argument("--minimum-ready-stations", type=int, default=None); parser.add_argument("--verbose", action="store_true"); args = parser.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
+    try: asyncio.run(run(args.host, args.port, args.credential_file, Scenario.from_file(args.scenario, minimum_ready_stations=args.minimum_ready_stations)))
     except (ValueError, KeyboardInterrupt) as error:
         if isinstance(error, ValueError): parser.error(str(error))
 
