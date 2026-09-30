@@ -464,3 +464,198 @@ async def test_unexpected_close_failure_does_not_leak_tasks(worlds, caplog):
     assert not world._session_tasks
     assert "close failed (RuntimeError)" in caplog.text
     assert "sensitive peer data" not in caplog.text
+
+
+def advertise_message(world, *, selling=(1,), seeking=(2,), expires=3):
+    message = world.pb.ClientMessage()
+    command = message.advertise
+    command.type = world.pb.ADVERTISE_TYPE_ADVERTISE
+    command.protocol_version = '2.0'
+    command.run_id = world.run_id
+    command.request_id = 'advertise-1'
+    command.body.selling.SetInParent()
+    command.body.selling.items.extend(selling)
+    command.body.seeking.SetInParent()
+    command.body.seeking.items.extend(seeking)
+    command.body.expires_tick = expires
+    return message
+
+
+async def advertisement_client(world, station='P01'):
+    socket = FakeSocket()
+    await world.attach(station, socket)
+    await received(world, socket)
+    world.phase = 'RUNNING'
+    world.stations[station].ready = True
+    return socket
+
+
+async def test_advertisements_public_replace_and_leave_inventory_unchanged(worlds):
+    world = worlds()
+    first = await advertisement_client(world)
+    second = await advertisement_client(world, 'P02')
+    inventory = {key: dict(value.inventory) for key, value in world.stations.items()}
+    await world.handle('P01', advertise_message(world))
+    result = (await received(world, first)).result
+    state = (await received(world, first)).state
+    peer = (await received(world, second)).state
+    assert result.ok
+    assert state.advertisements == peer.advertisements
+    listing = state.advertisements.items[0]
+    assert listing.advertisement_id == result.object_id.value
+    assert listing.station_id == 'P01'
+    assert list(listing.selling.items) == [world.pb.RESOURCE_WATER]
+    assert list(listing.seeking.items) == [world.pb.RESOURCE_FOOD]
+    assert listing.created_tick == 0
+    assert listing.created_version == state.world_version
+    assert listing.expires_tick == 3
+    await world.handle('P02', advertise_message(world, selling=(), seeking=(3,)))
+    await received(world, second)
+    await received(world, second)
+    await received(world, first)
+    await world.handle('P01', advertise_message(world, selling=(3,), seeking=()))
+    replacement = (await received(world, first)).result
+    state = (await received(world, first)).state
+    assert replacement.ok
+    assert replacement.object_id.value != result.object_id.value
+    assert len(state.advertisements.items) == 2
+    assert world.advertisements[0].status == world.pb.PUBLICATION_STATUS_REPLACED
+    assert {key: value.inventory for key, value in world.stations.items()} == inventory
+
+
+@pytest.mark.parametrize('selling,seeking,expires', [
+    ((), (), 3), ((1, 1), (2,), 3), ((1,), (2, 2), 3),
+    ((1,), (1,), 3), ((1,), (2,), 0), ((1,), (2,), 4),
+])
+async def test_invalid_advertisement_does_not_replace_listing(worlds, selling, seeking, expires):
+    world = worlds()
+    socket = await advertisement_client(world)
+    await world.handle('P01', advertise_message(world))
+    await received(world, socket)
+    await received(world, socket)
+    version = world.world_version
+    await world.handle('P01', advertise_message(world, selling=selling, seeking=seeking, expires=expires))
+    result = (await received(world, socket)).result
+    assert not result.ok
+    assert result.code == world.pb.RESULT_CODE_INVALID_ARGUMENT
+    assert world.world_version == version
+    assert len(world.advertisements) == 1
+    assert world.advertisements[0].status == world.pb.PUBLICATION_STATUS_ACTIVE
+
+
+@pytest.mark.parametrize('invalid', ['ready', 'phase', 'failed', 'run_id', 'protocol_version'])
+async def test_advertisement_requires_current_ready_trading_session(worlds, invalid):
+    world = worlds()
+    socket = await advertisement_client(world)
+    message = advertise_message(world)
+    if invalid == 'ready':
+        world.stations['P01'].ready = False
+    elif invalid == 'phase':
+        world.phase = 'FINISHED'
+    elif invalid == 'failed':
+        world.stations['P01'].failed_once = True
+    else:
+        setattr(message.advertise, invalid, 'invalid')
+    await world.handle('P01', message)
+    assert not (await received(world, socket)).result.ok
+    assert not world.advertisements
+
+
+async def test_advertisement_withdrawal_requires_owner_and_active_listing(worlds):
+    world = worlds()
+    owner = await advertisement_client(world)
+    other = await advertisement_client(world, 'P02')
+    await world.handle('P01', advertise_message(world))
+    result = (await received(world, owner)).result
+    await received(world, owner)
+    await received(world, other)
+    message = world.pb.ClientMessage()
+    command = message.withdraw
+    command.type = world.pb.WITHDRAW_TYPE_WITHDRAW
+    command.protocol_version = '2.0'
+    command.run_id = world.run_id
+    command.request_id = 'withdraw-1'
+    command.body.object_id = result.object_id.value
+    version = world.world_version
+    await world.handle('P02', message)
+    assert not (await received(world, other)).result.ok
+    assert world.world_version == version
+    assert len(world._state('P02').state.advertisements.items) == 1
+    await world.handle('P01', message)
+    assert (await received(world, owner)).result.ok
+    assert not (await received(world, owner)).state.advertisements.items
+    assert not (await received(world, other)).state.advertisements.items
+    assert world.advertisements[0].status == world.pb.PUBLICATION_STATUS_WITHDRAWN
+    await world.handle('P01', message)
+    assert not (await received(world, owner)).result.ok
+
+
+@pytest.mark.parametrize('finishing', [False, True])
+async def test_advertisements_expire_or_close_at_run_end(worlds, finishing):
+    world = worlds()
+    socket = await advertisement_client(world)
+    if finishing:
+        world.scenario = replace(world.scenario, duration_ticks=2)
+    await world.handle('P01', advertise_message(world, expires=2))
+    await received(world, socket)
+    await received(world, socket)
+    await world.advance_tick()
+    assert len(world._state('P01').state.advertisements.items) == 1
+    await world.advance_tick()
+    await world.broadcast_state()
+    assert not (await received(world, socket)).state.advertisements.items
+    expected = world.pb.PUBLICATION_STATUS_RUN_ENDED if finishing else world.pb.PUBLICATION_STATUS_EXPIRED
+    assert world.advertisements[0].status == expected
+
+
+@pytest.mark.parametrize('limit', [0, -1, True, 1.5])
+def test_invalid_publication_ttl_configuration(tmp_path, limit):
+    path = scenario_file(tmp_path)
+    raw = json.loads(path.read_text())
+    raw['economy']['max_publication_ttl_ticks'] = limit
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match='positive integers'):
+        Scenario.from_file(path)
+
+
+async def test_configured_publication_ttl_and_run_boundary(worlds, tmp_path):
+    world = worlds()
+    path = scenario_file(tmp_path)
+    raw = json.loads(path.read_text())
+    raw['economy']['max_publication_ttl_ticks'] = 5
+    raw['duration_ticks'] = 4
+    path.write_text(json.dumps(raw))
+    world.scenario = Scenario.from_file(path)
+    socket = await advertisement_client(world)
+    assert world._state('P01').state.rules.max_publication_ttl_ticks == 5
+    await world.handle('P01', advertise_message(world, expires=5))
+    assert not (await received(world, socket)).result.ok
+    await world.handle('P01', advertise_message(world, expires=4))
+    assert (await received(world, socket)).result.ok
+
+
+async def test_repeated_offer_request_still_creates_new_offers(worlds):
+    world = worlds()
+    world.scenario = replace(world.scenario, economy=replace(
+        world.scenario.economy, max_open_outgoing_offers=2))
+    socket = await advertisement_client(world)
+    message = world.pb.ClientMessage()
+    offer = message.offer
+    offer.type = world.pb.OFFER_COMMAND_TYPE_OFFER
+    offer.protocol_version = '2.0'
+    offer.run_id = world.run_id
+    offer.request_id = 'same-request'
+    offer.body.recipient_id = 'P02'
+    offer.body.give.water = 1
+    offer.body.give.food = offer.body.give.components = 0
+    offer.body.receive.water = offer.body.receive.food = offer.body.receive.components = 0
+    offer.body.expires_tick = 3
+    ids = []
+    for _ in range(2):
+        await world.handle('P01', message)
+        result = (await received(world, socket)).result
+        assert result.ok
+        ids.append(result.object_id.value)
+        await received(world, socket)
+    assert ids[0] != ids[1]
+    assert len(world.offers) == 2

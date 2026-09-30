@@ -43,6 +43,7 @@ class Economy:
     max_health: int = 100
     shortage_damage_per_unit: int = 4
     recovery_per_fully_supplied_tick: int = 1
+    max_publication_ttl_ticks: int = 3
     max_offer_ttl_ticks: int = 3
     max_open_outgoing_offers: int = 1
 
@@ -77,7 +78,7 @@ class Scenario:
             **{name: economy_raw.get(name, default) for name, default in {
                 "production_per_tick": 4, "max_health": 100, "shortage_damage_per_unit": 4,
                 "recovery_per_fully_supplied_tick": 1, "max_offer_ttl_ticks": 3,
-                "max_open_outgoing_offers": 1}.items()},
+                "max_publication_ttl_ticks": 3, "max_open_outgoing_offers": 1}.items()},
         )
         if any(not isinstance(getattr(economy, name), int) or isinstance(getattr(economy, name), bool) or getattr(economy, name) < 1 for name in economy.__dataclass_fields__ if name != "upkeep"):
             raise ValueError("economy numeric values must be positive integers")
@@ -235,6 +236,8 @@ class DemoBazaar:
         self.run_id, self.tick, self.world_version, self.phase = f"demo-{secrets.token_hex(6)}", 0, 1, "READY"
         self.stations = {spec.station_id: Station(spec, secrets.token_urlsafe(24), health=scenario.economy.max_health, inventory=dict(spec.inventory)) for spec in scenario.stations}
         self.offers: list[Offer] = []
+        self.advertisements: list[Any] = []
+        self._advertisement_sequence = 0
         self.connections: dict[str, ClientSession] = {}
         self.delivery_limits = delivery_limits or DeliveryLimits()
         self._session_tasks: set[asyncio.Task] = set()
@@ -289,6 +292,7 @@ class DemoBazaar:
         kind = message.WhichOneof("message")
         if kind == "ready": await self._ready(station_id, message.ready)
         elif kind == "sync": await self._send_state(station_id)
+        elif kind == "advertise": await self._advertise(station_id, message.advertise)
         elif kind == "offer": await self._offer(station_id, message.offer)
         elif kind == "accept": await self._accept(station_id, message.accept)
         elif kind == "withdraw": await self._withdraw(station_id, message.withdraw)
@@ -304,6 +308,41 @@ class DemoBazaar:
 
     @staticmethod
     def _proto_bundle(value: Any) -> dict[str, int]: return {name: int(getattr(value, name)) for name in RESOURCES}
+
+    async def _advertise(self, station_id: str, command: Any) -> None:
+        selling, seeking = tuple(command.body.selling.items), tuple(command.body.seeking.items)
+        resources = {getattr(self.pb, f"RESOURCE_{name.upper()}") for name in RESOURCES}
+        valid = (
+            command.IsInitialized() and self._can_trade(station_id, command)
+            and bool(selling or seeking)
+            and set(selling) <= resources and set(seeking) <= resources
+            and len(set(selling)) == len(selling) and len(set(seeking)) == len(seeking)
+            and not set(selling).intersection(seeking)
+            and self.tick < command.body.expires_tick <= min(
+                self.tick + self.scenario.economy.max_publication_ttl_ticks,
+                self.scenario.duration_ticks,
+            )
+        )
+        if not valid:
+            await self._result(station_id, command.request_id, False, "RESULT_CODE_INVALID_ARGUMENT")
+            return
+        for advertisement in self.advertisements:
+            if advertisement.station_id == station_id and advertisement.status == self.pb.PUBLICATION_STATUS_ACTIVE:
+                advertisement.status = self.pb.PUBLICATION_STATUS_REPLACED
+        self._advertisement_sequence += 1
+        self.world_version += 1
+        advertisement = self.pb.Advertisement(
+            advertisement_id=f"demo-advertisement-{self._advertisement_sequence}",
+            station_id=station_id, expires_tick=command.body.expires_tick,
+            status=self.pb.PUBLICATION_STATUS_ACTIVE,
+            created_tick=self.tick, created_version=self.world_version,
+        )
+        advertisement.selling.CopyFrom(command.body.selling)
+        advertisement.seeking.CopyFrom(command.body.seeking)
+        self.advertisements.append(advertisement)
+        await self._result(station_id, command.request_id, True, "RESULT_CODE_OK",
+                           object_id=advertisement.advertisement_id)
+        await self.broadcast_state()
 
     async def _offer(self, station_id: str, command: Any) -> None:
         station = self.stations[station_id]; give, receive = self._proto_bundle(command.body.give), self._proto_bundle(command.body.receive)
@@ -325,6 +364,20 @@ class DemoBazaar:
         await self._result(station_id, command.request_id, True, "RESULT_CODE_OK", object_id=offer.offer_id, transaction_id=offer.transaction_id); await self.broadcast_state()
 
     async def _withdraw(self, station_id: str, command: Any) -> None:
+        advertisement = next((item for item in self.advertisements
+                              if item.advertisement_id == command.body.object_id), None)
+        if advertisement is not None:
+            if not (self._can_trade(station_id, command)
+                    and advertisement.station_id == station_id
+                    and advertisement.status == self.pb.PUBLICATION_STATUS_ACTIVE):
+                await self._result(station_id, command.request_id, False, "RESULT_CODE_NOT_FOUND")
+                return
+            advertisement.status = self.pb.PUBLICATION_STATUS_WITHDRAWN
+            self.world_version += 1
+            await self._result(station_id, command.request_id, True, "RESULT_CODE_OK",
+                               object_id=advertisement.advertisement_id)
+            await self.broadcast_state()
+            return
         offer = next((item for item in self.offers if item.offer_id == command.body.object_id), None)
         if not (self._can_trade(station_id, command) and offer and offer.proposer_id == station_id and offer.status == self.pb.OFFER_STATUS_OPEN): await self._result(station_id, command.request_id, False, "RESULT_CODE_NOT_FOUND"); return
         offer.status = self.pb.OFFER_STATUS_WITHDRAWN; offer.closed_tick = self.tick; self.world_version += 1; await self._result(station_id, command.request_id, True, "RESULT_CODE_OK", object_id=offer.offer_id); await self.broadcast_state()
@@ -336,6 +389,12 @@ class DemoBazaar:
     async def advance_tick(self) -> None:
         if self.phase != "RUNNING": return
         self.tick += 1
+        for advertisement in self.advertisements:
+            if advertisement.status == self.pb.PUBLICATION_STATUS_ACTIVE:
+                if self.tick >= self.scenario.duration_ticks:
+                    advertisement.status = self.pb.PUBLICATION_STATUS_RUN_ENDED
+                elif advertisement.expires_tick <= self.tick:
+                    advertisement.status = self.pb.PUBLICATION_STATUS_EXPIRED
         for offer in self.offers:
             if offer.status == self.pb.OFFER_STATUS_OPEN and offer.expires_tick <= self.tick: offer.status = self.pb.OFFER_STATUS_EXPIRED; offer.closed_tick = self.tick
         for station in self.stations.values(): self._advance_station(station)
@@ -369,11 +428,14 @@ class DemoBazaar:
         for name, amount in source.items(): setattr(target, name, amount)
     def _state(self, station_id: str) -> Any:
         message = self.pb.ServerMessage(); state = message.state; state.type = self.pb.STATE_TYPE_STATE; state.protocol_version = PROTOCOL_VERSION; state.run_id = self.run_id; state.world_version = self.world_version; state.tick = self.tick; state.phase = getattr(self.pb, f"PHASE_{self.phase}"); state.self_station_id = station_id
-        rules = state.rules; rules.rules_version = "demo-1"; rules.duration_ticks = self.scenario.duration_ticks; rules.tick_duration_ms = self.scenario.tick_duration_ms; rules.resource_order.items.extend(getattr(self.pb, f"RESOURCE_{r.upper()}") for r in RESOURCES); rules.max_health = self.scenario.economy.max_health; rules.shortage_damage_per_unit = self.scenario.economy.shortage_damage_per_unit; rules.recovery_per_fully_supplied_tick = self.scenario.economy.recovery_per_fully_supplied_tick; rules.max_publication_ttl_ticks = 1; rules.max_offer_ttl_ticks = self.scenario.economy.max_offer_ttl_ticks; rules.new_commands_per_station_per_tick = 1; rules.max_request_records_per_station = 32; rules.max_open_outgoing_offers = self.scenario.economy.max_open_outgoing_offers; rules.max_command_bytes = 65536
+        rules = state.rules; rules.rules_version = "demo-1"; rules.duration_ticks = self.scenario.duration_ticks; rules.tick_duration_ms = self.scenario.tick_duration_ms; rules.resource_order.items.extend(getattr(self.pb, f"RESOURCE_{r.upper()}") for r in RESOURCES); rules.max_health = self.scenario.economy.max_health; rules.shortage_damage_per_unit = self.scenario.economy.shortage_damage_per_unit; rules.recovery_per_fully_supplied_tick = self.scenario.economy.recovery_per_fully_supplied_tick; rules.max_publication_ttl_ticks = self.scenario.economy.max_publication_ttl_ticks; rules.max_offer_ttl_ticks = self.scenario.economy.max_offer_ttl_ticks; rules.new_commands_per_station_per_tick = 1; rules.max_request_records_per_station = 32; rules.max_open_outgoing_offers = self.scenario.economy.max_open_outgoing_offers; rules.max_command_bytes = 65536
         for item in self.stations.values(): entry = state.directory.items.add(); entry.station_id = item.spec.station_id; entry.display_name = item.spec.station_id
         station = self.stations[station_id]; target = state.self; target.station_id = station_id; self._copy_bundle(station.inventory, target.inventory); target.health = station.health; target.failed_once = station.failed_once; (setattr(target.first_failure_tick, "null", True) if station.first_failure_tick is None else setattr(target.first_failure_tick, "value", station.first_failure_tick)); self._copy_bundle(station.last_production, target.last_production); self._copy_bundle(station.last_unmet_upkeep, target.last_unmet_upkeep); target.fully_supplied_ticks = station.fully_supplied_ticks; target.shortage_ticks = station.shortage_ticks; target.current_shortage_streak = station.current_shortage_streak; target.longest_shortage_streak = station.longest_shortage_streak
         for name in ("produced_total", "consumed_total", "unmet_total", "imported_total", "exported_total"): self._copy_bundle(getattr(station, name), getattr(target, name))
         self._copy_bundle(self.scenario.economy.upkeep, target.upkeep_per_tick); target.specialty = getattr(self.pb, f"RESOURCE_{station.spec.specialty.upper()}"); state.offers.SetInParent(); state.advertisements.SetInParent(); state.transactions.SetInParent(); state.request_results.SetInParent()
+        for item in self.advertisements:
+            if item.status == self.pb.PUBLICATION_STATUS_ACTIVE:
+                state.advertisements.items.add().CopyFrom(item)
         for item in self.offers:
             offer = state.offers.items.add(); offer.offer_id = item.offer_id; offer.proposer_id = item.proposer_id; offer.recipient_id = item.recipient_id; self._copy_bundle(item.give, offer.give); self._copy_bundle(item.receive, offer.receive); offer.created_tick = item.created_tick; offer.created_version = item.created_version; offer.expires_tick = item.expires_tick; offer.status = item.status; (setattr(offer.closed_tick, "null", True) if item.closed_tick is None else setattr(offer.closed_tick, "value", item.closed_tick)); (setattr(offer.transaction_id, "null", True) if item.transaction_id is None else setattr(offer.transaction_id, "value", item.transaction_id))
             if item.transaction_id:
