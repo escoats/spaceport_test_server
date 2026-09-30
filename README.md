@@ -30,8 +30,8 @@ bundles must name only `water`, `food`, and `components`, with non-negative
 integer amounts.
 
 This is a test server rather than a full production Bazaar implementation. It
-does not yet implement request-result history/idempotency or
-the authoritative server's complete rate-limit and error semantics.
+does not yet implement the authoritative server's complete rate-limit and error
+semantics.
 
 ## Client delivery behavior
 
@@ -44,7 +44,7 @@ restart at 1 on a new connection.
 
 Command results, readiness replies, and protocol errors keep their order and are
 never coalesced. Snapshots are only replaced when no such message separates them.
-A connection is closed with WebSocket code `1013` if a send stalls for five seconds or its pending queue exceeds 64 messages or 8 MiB after snapshot coalescing. Close handshakes are limited to two seconds. Reconnect and declare readiness again to continue; retries are still subject to the lack of idempotency described above.
+A connection is closed with WebSocket code `1013` if a send stalls for five seconds or its pending queue exceeds 64 messages or 8 MiB after snapshot coalescing. Close handshakes are limited to two seconds. Reconnect and declare readiness again to continue; retry commands with their original request IDs to recover their results.
 
 A new connection replaces the previous connection for that station. Disconnects
 reset that station's readiness but do not pause a running simulation. The server
@@ -71,5 +71,43 @@ using its ID in `withdraw.body.object_id`. Replaced, withdrawn, expired, and
 run-ended listings are omitted from snapshots. At the final tick, remaining
 active listings are marked run-ended.
 
-Repeated valid offer submissions still create new offers, even when they reuse
-a request ID, subject to the existing offer validation and open-offer limit.
+## Request history and retries
+
+Each station retains command results for the lifetime of the server run. Use a
+new request ID for each new `advertise`, `offer`, `accept`, or `withdraw` command.
+IDs must contain 1–64 ASCII letters, digits, underscores, or hyphens.
+
+Retrying the same decoded command with its original ID returns the original
+result followed by a fresh state, without repeating the action or changing the
+world version. The result retains its original tick, version, object ID, and
+transaction ID, even after expiry, station failure, or normal run completion.
+Changing the command type or payload while reusing an ID returns
+`RESULT_CODE_REQUEST_ID_CONFLICT`; the original record remains intact.
+
+Snapshots include only the receiving station's stored results in
+`request_results.items`, in insertion order. Both successful commands and
+commands rejected by gameplay validation are recorded. Reconnects retain this
+history, but require readiness again before commands or retries. Restarting the
+server creates a new run with empty history.
+
+Set `economy.max_request_records_per_station` to a positive integer to configure
+capacity (default: 10,000 per station per run). At capacity, new requests receive only
+`CONTROL_CODE_REQUEST_CAPACITY_EXCEEDED`, including their request ID and
+`close_session: false`. They neither execute nor consume a record. Exact retries,
+conflict checks, sync, and readiness remain available; records are never evicted.
+Invalid request IDs, wrong run/protocol values, and commands before readiness
+receive `CONTROL_CODE_BAD_MESSAGE` without consuming history. Conflict responses
+also do not replace or add records.
+
+## Permanent planet failure
+
+A planet is permanently dead when its health reaches zero or `failed_once` is
+true. Its `advertise`, `offer`, `accept`, and `withdraw` commands return
+`RESULT_CODE_STATION_FAILED` without changing gameplay state. Living planets
+cannot offer trades to dead planets or accept offers from dead proposers.
+Existing offers remain visible until their usual lifecycle closes them; living
+proposers can still withdraw their own offers to dead recipients.
+
+Dead planets' advertisements are hidden from all snapshots, including sync and
+reconnect snapshots. Stored advertisements retain their usual expiry and
+end-of-run lifecycle. Readiness, sync, and reconnect access remain available.
