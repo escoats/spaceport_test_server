@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import secrets
 from collections import deque
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ class Economy:
     max_publication_ttl_ticks: int = 3
     max_offer_ttl_ticks: int = 3
     max_open_outgoing_offers: int = 1
+    max_request_records_per_station: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,8 @@ class Scenario:
             **{name: economy_raw.get(name, default) for name, default in {
                 "production_per_tick": 4, "max_health": 100, "shortage_damage_per_unit": 4,
                 "recovery_per_fully_supplied_tick": 1, "max_offer_ttl_ticks": 3,
-                "max_publication_ttl_ticks": 3, "max_open_outgoing_offers": 1}.items()},
+                "max_publication_ttl_ticks": 3, "max_open_outgoing_offers": 1,
+                "max_request_records_per_station": 10_000}.items()},
         )
         if any(not isinstance(getattr(economy, name), int) or isinstance(getattr(economy, name), bool) or getattr(economy, name) < 1 for name in economy.__dataclass_fields__ if name != "upkeep"):
             raise ValueError("economy numeric values must be positive integers")
@@ -235,6 +238,8 @@ class DemoBazaar:
         self.scenario, self.pb = scenario, protobuf_module()
         self.run_id, self.tick, self.world_version, self.phase = f"demo-{secrets.token_hex(6)}", 0, 1, "READY"
         self.stations = {spec.station_id: Station(spec, secrets.token_urlsafe(24), health=scenario.economy.max_health, inventory=dict(spec.inventory)) for spec in scenario.stations}
+        self.request_history: dict[str, dict[str, tuple[bytes, bytes]]] = {station_id: {} for station_id in self.stations}
+        self._pending_requests: dict[str, bytes] = {}
         self.offers: list[Offer] = []
         self.advertisements: list[Any] = []
         self._advertisement_sequence = 0
@@ -294,6 +299,40 @@ class DemoBazaar:
         if session is not None and (session.closed or self.connections.get(station_id) is not session):
             return
         kind = message.WhichOneof("message")
+        if kind in {"advertise", "offer", "accept", "withdraw"}:
+            await self._command(station_id, message, kind)
+            return
+        await self._dispatch(station_id, message, kind)
+
+    async def _command(self, station_id: str, message: Any, kind: str) -> None:
+        command = getattr(message, kind)
+        # Session/envelope failures do not consume request history.
+        if (command.protocol_version != PROTOCOL_VERSION or command.run_id != self.run_id
+                or not self.stations[station_id].ready
+                or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", command.request_id) is None):
+            await self._protocol_error(station_id, request_id=command.request_id)
+            return
+        fingerprint = message.SerializeToString(deterministic=True)
+        history = self.request_history[station_id]
+        previous = history.get(command.request_id)
+        if previous is not None:
+            if previous[0] != fingerprint:
+                await self._result(station_id, command.request_id, False, "RESULT_CODE_REQUEST_ID_CONFLICT")
+            else:
+                await self._send(station_id, self.pb.ServerMessage.FromString(previous[1]))
+                await self._send_state(station_id)
+            return
+        if len(history) >= self.scenario.economy.max_request_records_per_station:
+            await self._protocol_error(station_id, code="CONTROL_CODE_REQUEST_CAPACITY_EXCEEDED",
+                                       request_id=command.request_id)
+            return
+        self._pending_requests[station_id] = fingerprint
+        try:
+            await self._dispatch(station_id, message, kind)
+        finally:
+            self._pending_requests.pop(station_id, None)
+
+    async def _dispatch(self, station_id: str, message: Any, kind: str | None) -> None:
         if kind in {"advertise", "offer", "accept", "withdraw"} and self._is_dead(station_id):
             await self._result(station_id, getattr(message, kind).request_id, False,
                                "RESULT_CODE_STATION_FAILED")
@@ -442,11 +481,13 @@ class DemoBazaar:
         for name, amount in source.items(): setattr(target, name, amount)
     def _state(self, station_id: str) -> Any:
         message = self.pb.ServerMessage(); state = message.state; state.type = self.pb.STATE_TYPE_STATE; state.protocol_version = PROTOCOL_VERSION; state.run_id = self.run_id; state.world_version = self.world_version; state.tick = self.tick; state.phase = getattr(self.pb, f"PHASE_{self.phase}"); state.self_station_id = station_id
-        rules = state.rules; rules.rules_version = "demo-1"; rules.duration_ticks = self.scenario.duration_ticks; rules.tick_duration_ms = self.scenario.tick_duration_ms; rules.resource_order.items.extend(getattr(self.pb, f"RESOURCE_{r.upper()}") for r in RESOURCES); rules.max_health = self.scenario.economy.max_health; rules.shortage_damage_per_unit = self.scenario.economy.shortage_damage_per_unit; rules.recovery_per_fully_supplied_tick = self.scenario.economy.recovery_per_fully_supplied_tick; rules.max_publication_ttl_ticks = self.scenario.economy.max_publication_ttl_ticks; rules.max_offer_ttl_ticks = self.scenario.economy.max_offer_ttl_ticks; rules.new_commands_per_station_per_tick = 1; rules.max_request_records_per_station = 32; rules.max_open_outgoing_offers = self.scenario.economy.max_open_outgoing_offers; rules.max_command_bytes = 65536
+        rules = state.rules; rules.rules_version = "demo-1"; rules.duration_ticks = self.scenario.duration_ticks; rules.tick_duration_ms = self.scenario.tick_duration_ms; rules.resource_order.items.extend(getattr(self.pb, f"RESOURCE_{r.upper()}") for r in RESOURCES); rules.max_health = self.scenario.economy.max_health; rules.shortage_damage_per_unit = self.scenario.economy.shortage_damage_per_unit; rules.recovery_per_fully_supplied_tick = self.scenario.economy.recovery_per_fully_supplied_tick; rules.max_publication_ttl_ticks = self.scenario.economy.max_publication_ttl_ticks; rules.max_offer_ttl_ticks = self.scenario.economy.max_offer_ttl_ticks; rules.new_commands_per_station_per_tick = 1; rules.max_request_records_per_station = self.scenario.economy.max_request_records_per_station; rules.max_open_outgoing_offers = self.scenario.economy.max_open_outgoing_offers; rules.max_command_bytes = 65536
         for item in self.stations.values(): entry = state.directory.items.add(); entry.station_id = item.spec.station_id; entry.display_name = item.spec.station_id
         station = self.stations[station_id]; target = state.self; target.station_id = station_id; self._copy_bundle(station.inventory, target.inventory); target.health = station.health; target.failed_once = station.failed_once; (setattr(target.first_failure_tick, "null", True) if station.first_failure_tick is None else setattr(target.first_failure_tick, "value", station.first_failure_tick)); self._copy_bundle(station.last_production, target.last_production); self._copy_bundle(station.last_unmet_upkeep, target.last_unmet_upkeep); target.fully_supplied_ticks = station.fully_supplied_ticks; target.shortage_ticks = station.shortage_ticks; target.current_shortage_streak = station.current_shortage_streak; target.longest_shortage_streak = station.longest_shortage_streak
         for name in ("produced_total", "consumed_total", "unmet_total", "imported_total", "exported_total"): self._copy_bundle(getattr(station, name), getattr(target, name))
         self._copy_bundle(self.scenario.economy.upkeep, target.upkeep_per_tick); target.specialty = getattr(self.pb, f"RESOURCE_{station.spec.specialty.upper()}"); state.offers.SetInParent(); state.advertisements.SetInParent(); state.transactions.SetInParent(); state.request_results.SetInParent()
+        for _, result_bytes in self.request_history[station_id].values():
+            state.request_results.items.add().CopyFrom(self.pb.ServerMessage.FromString(result_bytes).result)
         for item in self.advertisements:
             if item.status == self.pb.PUBLICATION_STATUS_ACTIVE and not self._is_dead(item.station_id):
                 state.advertisements.items.add().CopyFrom(item)
@@ -458,9 +499,26 @@ class DemoBazaar:
         else: state.outcome.null = True
         return message
     async def _result(self, station_id: str, request_id: str, ok: bool, code: str, *, object_id: str | None = None, transaction_id: str | None = None) -> None:
-        message = self.pb.ServerMessage(); result = message.result; result.type = self.pb.RESULT_TYPE_RESULT; result.protocol_version = PROTOCOL_VERSION; result.run_id = self.run_id; result.request_id = request_id; result.ok = ok; result.code = getattr(self.pb, code); result.processed_tick = self.tick; result.processed_version = self.world_version; (setattr(result.object_id, "value", object_id) if object_id else setattr(result.object_id, "null", True)); (setattr(result.transaction_id, "value", transaction_id) if transaction_id else setattr(result.transaction_id, "null", True)); result.retry_after_tick.null = True; await self._send(station_id, message)
-    async def _protocol_error(self, station_id: str) -> None:
-        message = self.pb.ServerMessage(); error = message.protocol_error; error.type = self.pb.PROTOCOL_ERROR_TYPE_PROTOCOL_ERROR; error.protocol_version = PROTOCOL_VERSION; error.run_id.value = self.run_id; error.request_id.null = True; error.code = self.pb.CONTROL_CODE_BAD_MESSAGE; error.close_session = False; await self._send(station_id, message)
+        message = self.pb.ServerMessage(); result = message.result; result.type = self.pb.RESULT_TYPE_RESULT; result.protocol_version = PROTOCOL_VERSION; result.run_id = self.run_id; result.request_id = request_id; result.ok = ok; result.code = getattr(self.pb, code); result.processed_tick = self.tick; result.processed_version = self.world_version; (setattr(result.object_id, "value", object_id) if object_id else setattr(result.object_id, "null", True)); (setattr(result.transaction_id, "value", transaction_id) if transaction_id else setattr(result.transaction_id, "null", True)); result.retry_after_tick.null = True
+        fingerprint = self._pending_requests.get(station_id)
+        if fingerprint is not None:
+            # Commit before publishing a result or a snapshot, even if delivery fails.
+            self.request_history[station_id][request_id] = (fingerprint, message.SerializeToString(deterministic=True))
+        await self._send(station_id, message)
+    async def _protocol_error(self, station_id: str, *, code: str = "CONTROL_CODE_BAD_MESSAGE",
+                              request_id: str | None = None) -> None:
+        message = self.pb.ServerMessage()
+        error = message.protocol_error
+        error.type = self.pb.PROTOCOL_ERROR_TYPE_PROTOCOL_ERROR
+        error.protocol_version = PROTOCOL_VERSION
+        error.run_id.value = self.run_id
+        if request_id is None:
+            error.request_id.null = True
+        else:
+            error.request_id.value = request_id
+        error.code = getattr(self.pb, code)
+        error.close_session = False
+        await self._send(station_id, message)
     async def _send(self, station_id: str, message: Any) -> None:
         session = self.connections.get(station_id)
         if session is not None:

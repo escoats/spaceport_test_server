@@ -466,13 +466,13 @@ async def test_unexpected_close_failure_does_not_leak_tasks(worlds, caplog):
     assert "sensitive peer data" not in caplog.text
 
 
-def advertise_message(world, *, selling=(1,), seeking=(2,), expires=3):
+def advertise_message(world, *, selling=(1,), seeking=(2,), expires=3, request_id='advertise-1'):
     message = world.pb.ClientMessage()
     command = message.advertise
     command.type = world.pb.ADVERTISE_TYPE_ADVERTISE
     command.protocol_version = '2.0'
     command.run_id = world.run_id
-    command.request_id = 'advertise-1'
+    command.request_id = request_id
     command.body.selling.SetInParent()
     command.body.selling.items.extend(selling)
     command.body.seeking.SetInParent()
@@ -513,7 +513,7 @@ async def test_advertisements_public_replace_and_leave_inventory_unchanged(world
     await received(world, second)
     await received(world, second)
     await received(world, first)
-    await world.handle('P01', advertise_message(world, selling=(3,), seeking=()))
+    await world.handle('P01', advertise_message(world, selling=(3,), seeking=(), request_id='replacement'))
     replacement = (await received(world, first)).result
     state = (await received(world, first)).state
     assert replacement.ok
@@ -534,7 +534,7 @@ async def test_invalid_advertisement_does_not_replace_listing(worlds, selling, s
     await received(world, socket)
     await received(world, socket)
     version = world.world_version
-    await world.handle('P01', advertise_message(world, selling=selling, seeking=seeking, expires=expires))
+    await world.handle('P01', advertise_message(world, selling=selling, seeking=seeking, expires=expires, request_id='invalid'))
     result = (await received(world, socket)).result
     assert not result.ok
     assert result.code == world.pb.RESULT_CODE_INVALID_ARGUMENT
@@ -557,7 +557,12 @@ async def test_advertisement_requires_current_ready_trading_session(worlds, inva
     else:
         setattr(message.advertise, invalid, 'invalid')
     await world.handle('P01', message)
-    assert not (await received(world, socket)).result.ok
+    response = await received(world, socket)
+    if invalid in {'ready', 'run_id', 'protocol_version'}:
+        assert response.protocol_error.code == world.pb.CONTROL_CODE_BAD_MESSAGE
+        assert not world.request_history['P01']
+    else:
+        assert not response.result.ok
     assert not world.advertisements
 
 
@@ -586,6 +591,7 @@ async def test_advertisement_withdrawal_requires_owner_and_active_listing(worlds
     assert not (await received(world, owner)).state.advertisements.items
     assert not (await received(world, other)).state.advertisements.items
     assert world.advertisements[0].status == world.pb.PUBLICATION_STATUS_WITHDRAWN
+    message.withdraw.request_id = 'withdraw-again'
     await world.handle('P01', message)
     assert not (await received(world, owner)).result.ok
 
@@ -630,11 +636,11 @@ async def test_configured_publication_ttl_and_run_boundary(worlds, tmp_path):
     assert world._state('P01').state.rules.max_publication_ttl_ticks == 5
     await world.handle('P01', advertise_message(world, expires=5))
     assert not (await received(world, socket)).result.ok
-    await world.handle('P01', advertise_message(world, expires=4))
+    await world.handle('P01', advertise_message(world, expires=4, request_id='valid-expiry'))
     assert (await received(world, socket)).result.ok
 
 
-async def test_repeated_offer_request_still_creates_new_offers(worlds):
+async def test_repeated_offer_request_replays_original_result(worlds):
     world = worlds()
     world.scenario = replace(world.scenario, economy=replace(
         world.scenario.economy, max_open_outgoing_offers=2))
@@ -657,8 +663,8 @@ async def test_repeated_offer_request_still_creates_new_offers(worlds):
         assert result.ok
         ids.append(result.object_id.value)
         await received(world, socket)
-    assert ids[0] != ids[1]
-    assert len(world.offers) == 2
+    assert ids[0] == ids[1]
+    assert len(world.offers) == 1
 
 
 def trade_message(world, kind, *, recipient='P02', object_id=''):
@@ -736,6 +742,7 @@ async def test_dead_initiator_rejected(worlds, monkeypatch, health, failed_once,
         object_id = (world.advertisements[0].advertisement_id if action == 'withdraw_ad'
                      else world.offers[0].offer_id)
         message = trade_message(world, 'withdraw', object_id=object_id)
+    getattr(message, message.WhichOneof('message')).request_id = 'after-death'
     world.stations['P01'].health = health
     world.stations['P01'].failed_once = failed_once
     await assert_failed_without_mutation(world, 'P01', socket, message, monkeypatch)
@@ -772,7 +779,9 @@ async def test_living_trade_and_withdrawal_to_dead_recipient(worlds):
     await received(world, first)
     assert world.offers[0].status == world.pb.OFFER_STATUS_ACCEPTED
     assert world.stations['P02'].imported_total['water'] == 1
-    await world.handle('P01', trade_message(world, 'offer'))
+    second_offer = trade_message(world, 'offer')
+    second_offer.offer.request_id = 'second-offer'
+    await world.handle('P01', second_offer)
     await received(world, first)
     await received(world, first)
     await received(world, second)
@@ -815,3 +824,109 @@ async def test_tick_death_hides_ads_and_preserves_sync_reconnect_and_failure(wor
     assert station.inventory == inventory
     await world.advance_tick()
     assert world.advertisements[0].status == world.pb.PUBLICATION_STATUS_EXPIRED
+
+
+@pytest.mark.parametrize('kind', ['advertise', 'offer', 'accept', 'withdraw'])
+async def test_retry_keeps_original_result_and_gameplay_after_world_changes(worlds, kind):
+    world = worlds()
+    socket = await advertisement_client(world)
+    if kind in {'accept', 'withdraw'}:
+        proposer = 'P02' if kind == 'accept' else 'P01'
+        world.stations[proposer].ready = True
+        world.stations[proposer].inventory['water'] = 10
+        await world.handle(proposer, trade_message(world, 'offer', recipient='P01' if proposer == 'P02' else 'P02'))
+        if proposer == 'P01':
+            await received(world, socket)
+        await received(world, socket)
+        message = trade_message(world, kind, object_id=world.offers[0].offer_id)
+    else:
+        message = advertise_message(world) if kind == 'advertise' else trade_message(world, kind)
+    await world.handle('P01', message)
+    original = (await received(world, socket)).result
+    assert original.ok
+    snapshot = (await received(world, socket)).state
+    assert snapshot.request_results.items[-1] == original
+    world.tick = 8
+    world.phase = 'FINISHED'
+    world.stations['P01'].failed_once = True
+    before = gameplay_state(world)
+    await world.handle('P01', message)
+    assert (await received(world, socket)).result == original
+    assert (await received(world, socket)).state.tick == 8
+    assert gameplay_state(world) == before
+
+
+async def test_failed_result_conflicts_capacity_and_private_history(worlds):
+    world = worlds()
+    world.scenario = replace(world.scenario, economy=replace(
+        world.scenario.economy, max_request_records_per_station=1))
+    socket = await advertisement_client(world)
+    message = advertise_message(world, expires=0)
+    await world.handle('P01', message)
+    original = (await received(world, socket)).result
+    assert original.code == world.pb.RESULT_CODE_INVALID_ARGUMENT
+    assert list(world._state('P01').state.request_results.items) == [original]
+    assert not world._state('P02').state.request_results.items
+    assert world._state('P01').state.rules.max_request_records_per_station == 1
+    for changed in (advertise_message(world), trade_message(world, 'offer')):
+        getattr(changed, changed.WhichOneof('message')).request_id = message.advertise.request_id
+        await world.handle('P01', changed)
+        assert (await received(world, socket)).result.code == world.pb.RESULT_CODE_REQUEST_ID_CONFLICT
+    await world.handle('P01', advertise_message(world, request_id='new'))
+    error = (await received(world, socket)).protocol_error
+    assert error.code == world.pb.CONTROL_CODE_REQUEST_CAPACITY_EXCEEDED
+    assert error.request_id.value == 'new'
+    assert not error.close_session
+    assert not world.advertisements
+    assert socket.sent.empty()
+    await world.handle('P01', message)
+    assert (await received(world, socket)).result == original
+    assert list((await received(world, socket)).state.request_results.items) == [original]
+    peer = await advertisement_client(world, 'P02')
+    await world.handle('P02', message)
+    assert (await received(world, peer)).result.code == world.pb.RESULT_CODE_INVALID_ARGUMENT
+    assert len(world.request_history['P02']) == 1
+
+
+async def test_reconnect_recovers_result_and_requires_readiness_before_retry(worlds):
+    world = worlds()
+    socket = await advertisement_client(world)
+    message = advertise_message(world)
+    await world.handle('P01', message)
+    # Replace the connection without consuming the original delivery.
+    replacement = FakeSocket()
+    await world.attach('P01', replacement)
+    state = (await received(world, replacement)).state
+    assert state.snapshot_sequence == 1
+    original = state.request_results.items[0]
+    await world.handle('P01', message)
+    assert (await received(world, replacement)).protocol_error.code == world.pb.CONTROL_CODE_BAD_MESSAGE
+    await world.handle('P01', ready_message(world))
+    await received(world, replacement)
+    await world.handle('P01', message)
+    assert (await received(world, replacement)).result == original
+    await received(world, replacement)
+    assert len(world.advertisements) == 1
+    await world.handle('P01', sync_message(world))
+    assert list((await received(world, replacement)).state.request_results.items) == [original]
+    fresh_world = worlds()
+    assert not fresh_world.request_history['P01']
+
+
+@pytest.mark.parametrize('request_id', ['', 'space here', 'x' * 65, 'é'])
+async def test_invalid_request_ids_do_not_consume_history(worlds, request_id):
+    world = worlds()
+    socket = await advertisement_client(world)
+    await world.handle('P01', advertise_message(world, request_id=request_id))
+    assert (await received(world, socket)).protocol_error.code == world.pb.CONTROL_CODE_BAD_MESSAGE
+    assert not world.request_history['P01']
+
+
+@pytest.mark.parametrize('limit', [0, -1, True, 1.5])
+def test_request_history_capacity_must_be_positive_integer(tmp_path, limit):
+    path = scenario_file(tmp_path)
+    raw = json.loads(path.read_text())
+    raw['economy']['max_request_records_per_station'] = limit
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match='positive integers'):
+        Scenario.from_file(path)
