@@ -659,3 +659,159 @@ async def test_repeated_offer_request_still_creates_new_offers(worlds):
         await received(world, socket)
     assert ids[0] != ids[1]
     assert len(world.offers) == 2
+
+
+def trade_message(world, kind, *, recipient='P02', object_id=''):
+    message = world.pb.ClientMessage()
+    command = getattr(message, kind)
+    command.type = getattr(world.pb, {
+        'offer': 'OFFER_COMMAND_TYPE_OFFER', 'accept': 'ACCEPT_TYPE_ACCEPT',
+        'withdraw': 'WITHDRAW_TYPE_WITHDRAW',
+    }[kind])
+    command.protocol_version = '2.0'
+    command.run_id = world.run_id
+    command.request_id = f'{kind}-failure-test'
+    if kind == 'offer':
+        command.body.recipient_id = recipient
+        for resource in ('water', 'food', 'components'):
+            setattr(command.body.give, resource, int(resource == 'water'))
+            setattr(command.body.receive, resource, 0)
+        command.body.expires_tick = 3
+    elif kind == 'accept':
+        command.body.offer_id = object_id
+    else:
+        command.body.object_id = object_id
+    return message
+
+
+def gameplay_state(world):
+    from copy import deepcopy
+    return deepcopy((
+        world.stations, world.offers, world.advertisements, world.tick,
+        world.world_version, world._advertisement_sequence,
+        world._offer_sequence, world._transaction_sequence,
+    ))
+
+
+async def assert_failed_without_mutation(world, station_id, socket, message, monkeypatch):
+    from unittest.mock import AsyncMock
+    broadcast = AsyncMock()
+    monkeypatch.setattr(world, 'broadcast_state', broadcast)
+    before = gameplay_state(world)
+    await world.handle(station_id, message)
+    result = (await received(world, socket)).result
+    assert not result.ok
+    assert result.code == world.pb.RESULT_CODE_STATION_FAILED
+    assert result.request_id == getattr(message, message.WhichOneof('message')).request_id
+    assert result.processed_tick == world.tick
+    assert result.processed_version == world.world_version
+    assert result.object_id.WhichOneof('kind') == 'null'
+    assert result.transaction_id.WhichOneof('kind') == 'null'
+    assert gameplay_state(world) == before
+    broadcast.assert_not_awaited()
+
+
+@pytest.mark.parametrize('health,failed_once', [(0, False), (50, True)])
+@pytest.mark.parametrize('action', ['advertise', 'offer', 'accept', 'withdraw_ad', 'withdraw_offer'])
+async def test_dead_initiator_rejected(worlds, monkeypatch, health, failed_once, action):
+    world = worlds()
+    socket = await advertisement_client(world)
+    world.stations['P02'].ready = True
+    await world.handle('P01', advertise_message(world))
+    await received(world, socket)
+    await received(world, socket)
+    await world.handle('P01', trade_message(world, 'offer'))
+    await received(world, socket)
+    await received(world, socket)
+    world.stations['P02'].inventory['water'] = 5
+    await world.handle('P02', trade_message(world, 'offer', recipient='P01'))
+    await received(world, socket)
+    if action == 'advertise':
+        message = advertise_message(world)
+    elif action == 'offer':
+        message = trade_message(world, 'offer')
+    elif action == 'accept':
+        message = trade_message(world, 'accept', object_id=world.offers[1].offer_id)
+    else:
+        object_id = (world.advertisements[0].advertisement_id if action == 'withdraw_ad'
+                     else world.offers[0].offer_id)
+        message = trade_message(world, 'withdraw', object_id=object_id)
+    world.stations['P01'].health = health
+    world.stations['P01'].failed_once = failed_once
+    await assert_failed_without_mutation(world, 'P01', socket, message, monkeypatch)
+
+
+@pytest.mark.parametrize('health,failed_once', [(0, False), (50, True)])
+@pytest.mark.parametrize('action', ['offer', 'accept'])
+async def test_dead_counterparty_rejected(worlds, monkeypatch, health, failed_once, action):
+    world = worlds()
+    socket = await advertisement_client(world)
+    world.stations['P02'].ready = True
+    world.stations['P02'].inventory['water'] = 5
+    await world.handle('P02', trade_message(world, 'offer', recipient='P01'))
+    await received(world, socket)
+    world.stations['P02'].health = health
+    world.stations['P02'].failed_once = failed_once
+    # Death must win over an acceptance's resource check.
+    world.stations['P02'].inventory['water'] = 0
+    message = trade_message(world, action, object_id=world.offers[0].offer_id)
+    await assert_failed_without_mutation(world, 'P01', socket, message, monkeypatch)
+
+
+async def test_living_trade_and_withdrawal_to_dead_recipient(worlds):
+    world = worlds()
+    first = await advertisement_client(world)
+    second = await advertisement_client(world, 'P02')
+    await world.handle('P01', trade_message(world, 'offer'))
+    assert (await received(world, first)).result.ok
+    await received(world, first)
+    await received(world, second)
+    await world.handle('P02', trade_message(world, 'accept', object_id=world.offers[0].offer_id))
+    assert (await received(world, second)).result.ok
+    await received(world, second)
+    await received(world, first)
+    assert world.offers[0].status == world.pb.OFFER_STATUS_ACCEPTED
+    assert world.stations['P02'].imported_total['water'] == 1
+    await world.handle('P01', trade_message(world, 'offer'))
+    await received(world, first)
+    await received(world, first)
+    await received(world, second)
+    world.stations['P02'].failed_once = True
+    await world.handle('P01', trade_message(world, 'withdraw', object_id=world.offers[1].offer_id))
+    assert (await received(world, first)).result.ok
+    assert world.offers[1].status == world.pb.OFFER_STATUS_WITHDRAWN
+
+
+async def test_tick_death_hides_ads_and_preserves_sync_reconnect_and_failure(worlds):
+    world = worlds()
+    first = await advertisement_client(world)
+    second = await advertisement_client(world, 'P02')
+    await world.handle('P01', advertise_message(world))
+    await received(world, first)
+    await received(world, first)
+    assert (await received(world, second)).state.advertisements.items
+    station = world.stations['P01']
+    station.health = 1
+    station.inventory = dict.fromkeys(station.inventory, 0)
+    await world.advance_tick()
+    assert station.health == 0 and station.failed_once
+    assert station.first_failure_tick == 1
+    await world.broadcast_state()
+    for socket in (first, second):
+        assert not (await received(world, socket)).state.advertisements.items
+    assert world.advertisements[0].status == world.pb.PUBLICATION_STATUS_ACTIVE
+    await world.handle('P01', sync_message(world))
+    assert not (await received(world, first)).state.advertisements.items
+    replacement = FakeSocket()
+    await world.attach('P01', replacement)
+    state = (await received(world, replacement)).state
+    assert state.self.failed_once and not state.advertisements.items
+    await world.handle('P01', ready_message(world))
+    assert (await received(world, replacement)).readiness.ready
+    station.inventory = dict.fromkeys(station.inventory, 100)
+    inventory = dict(station.inventory)
+    await world.advance_tick()
+    assert station.health == 0 and station.first_failure_tick == 1
+    assert station.inventory == inventory
+    await world.advance_tick()
+    assert world.advertisements[0].status == world.pb.PUBLICATION_STATUS_EXPIRED

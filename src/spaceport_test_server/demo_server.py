@@ -283,13 +283,21 @@ class DemoBazaar:
         while self._session_tasks:
             await asyncio.gather(*tuple(self._session_tasks), return_exceptions=True)
 
+    def _is_dead(self, station_id: str) -> bool:
+        station = self.stations[station_id]
+        return station.health == 0 or station.failed_once
+
     def _can_trade(self, station_id: str, command: Any) -> bool:
-        return self.phase == "RUNNING" and command.protocol_version == PROTOCOL_VERSION and command.run_id == self.run_id and self.stations[station_id].ready and not self.stations[station_id].failed_once
+        return self.phase == "RUNNING" and command.protocol_version == PROTOCOL_VERSION and command.run_id == self.run_id and self.stations[station_id].ready and not self._is_dead(station_id)
 
     async def handle(self, station_id: str, message: Any, *, session: ClientSession | None = None) -> None:
         if session is not None and (session.closed or self.connections.get(station_id) is not session):
             return
         kind = message.WhichOneof("message")
+        if kind in {"advertise", "offer", "accept", "withdraw"} and self._is_dead(station_id):
+            await self._result(station_id, getattr(message, kind).request_id, False,
+                               "RESULT_CODE_STATION_FAILED")
+            return
         if kind == "ready": await self._ready(station_id, message.ready)
         elif kind == "sync": await self._send_state(station_id)
         elif kind == "advertise": await self._advertise(station_id, message.advertise)
@@ -349,12 +357,18 @@ class DemoBazaar:
         outgoing = sum(offer.status == self.pb.OFFER_STATUS_OPEN and offer.proposer_id == station_id for offer in self.offers)
         valid = self._can_trade(station_id, command) and command.body.recipient_id in self.stations and command.body.recipient_id != station_id and any(give.values()) and not any(give[name] and receive[name] for name in RESOURCES) and all(station.inventory[name] >= amount for name, amount in give.items()) and self.tick < command.body.expires_tick <= min(self.tick + self.scenario.economy.max_offer_ttl_ticks, self.scenario.duration_ticks) and outgoing < self.scenario.economy.max_open_outgoing_offers
         if not valid: await self._result(station_id, command.request_id, False, "RESULT_CODE_INVALID_ARGUMENT"); return
+        if self._is_dead(command.body.recipient_id):
+            await self._result(station_id, command.request_id, False, "RESULT_CODE_STATION_FAILED")
+            return
         self._offer_sequence += 1; offer = Offer(f"demo-offer-{self._offer_sequence}", station_id, command.body.recipient_id, give, receive, command.body.expires_tick, self.pb.OFFER_STATUS_OPEN, self.tick, self.world_version + 1); self.offers.append(offer); self.world_version += 1
         await self._result(station_id, command.request_id, True, "RESULT_CODE_OK", object_id=offer.offer_id); await self.broadcast_state()
 
     async def _accept(self, station_id: str, command: Any) -> None:
         offer = next((item for item in self.offers if item.offer_id == command.body.offer_id), None)
         valid = self._can_trade(station_id, command) and offer is not None and offer.status == self.pb.OFFER_STATUS_OPEN and offer.recipient_id == station_id and offer.expires_tick > self.tick
+        if valid and self._is_dead(offer.proposer_id):
+            await self._result(station_id, command.request_id, False, "RESULT_CODE_STATION_FAILED")
+            return
         if valid:
             donor, recipient = self.stations[offer.proposer_id], self.stations[station_id]; valid = all(donor.inventory[n] >= offer.give[n] and recipient.inventory[n] >= offer.receive[n] for n in RESOURCES)
         if not valid: await self._result(station_id, command.request_id, False, "RESULT_CODE_NOT_OPEN"); return
@@ -434,7 +448,7 @@ class DemoBazaar:
         for name in ("produced_total", "consumed_total", "unmet_total", "imported_total", "exported_total"): self._copy_bundle(getattr(station, name), getattr(target, name))
         self._copy_bundle(self.scenario.economy.upkeep, target.upkeep_per_tick); target.specialty = getattr(self.pb, f"RESOURCE_{station.spec.specialty.upper()}"); state.offers.SetInParent(); state.advertisements.SetInParent(); state.transactions.SetInParent(); state.request_results.SetInParent()
         for item in self.advertisements:
-            if item.status == self.pb.PUBLICATION_STATUS_ACTIVE:
+            if item.status == self.pb.PUBLICATION_STATUS_ACTIVE and not self._is_dead(item.station_id):
                 state.advertisements.items.add().CopyFrom(item)
         for item in self.offers:
             offer = state.offers.items.add(); offer.offer_id = item.offer_id; offer.proposer_id = item.proposer_id; offer.recipient_id = item.recipient_id; self._copy_bundle(item.give, offer.give); self._copy_bundle(item.receive, offer.receive); offer.created_tick = item.created_tick; offer.created_version = item.created_version; offer.expires_tick = item.expires_tick; offer.status = item.status; (setattr(offer.closed_tick, "null", True) if item.closed_tick is None else setattr(offer.closed_tick, "value", item.closed_tick)); (setattr(offer.transaction_id, "null", True) if item.transaction_id is None else setattr(offer.transaction_id, "value", item.transaction_id))

@@ -73,3 +73,16 @@ active listings are marked run-ended.
 
 Repeated valid offer submissions still create new offers, even when they reuse
 a request ID, subject to the existing offer validation and open-offer limit.
+
+## Permanent planet failure
+
+A planet is permanently dead when its health reaches zero or `failed_once` is
+true. Its `advertise`, `offer`, `accept`, and `withdraw` commands return
+`RESULT_CODE_STATION_FAILED` without changing gameplay state. Living planets
+cannot offer trades to dead planets or accept offers from dead proposers.
+Existing offers remain visible until their usual lifecycle closes them; living
+proposers can still withdraw their own offers to dead recipients.
+
+Dead planets' advertisements are hidden from all snapshots, including sync and
+reconnect snapshots. Stored advertisements retain their usual expiry and
+end-of-run lifecycle. Readiness, sync, and reconnect access remain available.
