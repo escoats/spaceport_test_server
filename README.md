@@ -37,7 +37,7 @@ value and is validated against the number of configured stations.
 
 The server listens on port `3001` on all container interfaces. When using the
 devcontainer port forwarding, connect from the host at `ws://127.0.0.1:3001/ws`.
-Give each client the freshly generated `hivemind-credentials.json` file and the
+Give each client the freshly generated `demo-credentials.json` file and the
 `bazaar.protobuf.v2` WebSocket subprotocol.
 
 ## Configure a scenario
