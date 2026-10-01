@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spaceport-bazaar-test-server"
+version = "0.1.0"
+description = "Configurable local Spaceport Bazaar demo server"
+requires-python = ">=3.11"
+dependencies = ["protobuf>=5.28,<7", "websockets>=15,<16"]
+
+[project.optional-dependencies]
+dev = ["grpcio-tools>=1.66,<2", "pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
+
+[project.scripts]
+spaceport-demo-server = "spaceport_test_server.demo_server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+where = ["src"]

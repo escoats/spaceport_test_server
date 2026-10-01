@@ -1,0 +1,16 @@
+{
+  "duration_ticks": 30,
+  "tick_duration_ms": 1000,
+  "economy": {"upkeep": {"water": 2, "food": 1, "components": 1}, "production_per_tick": 4, "max_health": 100, "shortage_damage_per_unit": 4, "recovery_per_fully_supplied_tick": 1, "max_offer_ttl_ticks": 3, "max_open_outgoing_offers": 1},
+  "stations": [
+    {"id": "P01", "specialty": "water", "inventory": {"water": 12, "food": 4, "components": 4}},
+    {"id": "P02", "specialty": "food", "inventory": {"water": 0, "food": 8, "components": 4}},
+    {"id": "P03", "specialty": "components", "inventory": {"water": 4, "food": 4, "components": 12}},
+    {"id": "P04", "specialty": "water", "inventory": {"water": 12, "food": 4, "components": 4}},
+    {"id": "P05", "specialty": "food", "inventory": {"water": 0, "food": 8, "components": 4}},
+    {"id": "P06", "specialty": "components", "inventory": {"water": 4, "food": 4, "components": 12}},
+    {"id": "P07", "specialty": "water", "inventory": {"water": 12, "food": 4, "components": 4}},
+    {"id": "P08", "specialty": "food", "inventory": {"water": 0, "food": 8, "components": 4}},
+    {"id": "P09", "specialty": "components", "inventory": {"water": 4, "food": 4, "components": 12}}
+  ]
+}
