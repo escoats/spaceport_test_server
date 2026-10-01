@@ -13,6 +13,18 @@ Start the server with:
 make run
 ```
 
+Choose a scenario from `scenarios/` by passing its JSON filename through Make:
+
+```sh
+make run SCENARIO=surplus-3-planets.json
+```
+
+`SCENARIO` defaults to `default.json` in `scenarios/` and can be combined with
+`MIN`, for example `make run SCENARIO=surplus-3-planets.json MIN=3`.
+Values containing `/` are used as explicit paths, such as
+`SCENARIO=scenarios/surplus-3-planets.json` or `SCENARIO=/tmp/custom.json`.
+The equivalent direct command-line option is `--scenario <path>`.
+
 For running outside the dev container, install Python 3.11 or newer and set up
 the project first:
 
