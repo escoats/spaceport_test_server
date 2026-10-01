@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import secrets
+import socket
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -575,6 +576,17 @@ async def run(host: str, port: int, credential_file: Path, scenario: Scenario) -
     try:
         async with serve(DemoBazaarServer(world).handler, host, port, subprotocols=[SUBPROTOCOL],
                          max_size=2**20, close_timeout=world.delivery_limits.close_timeout):
+            LOG.info("WebSocket server listening on %s:%d", host, port)
+            if host in {"0.0.0.0", "::"}:
+                LOG.info("Client URL (same environment): ws://127.0.0.1:%d/ws", port)
+                try:
+                    container_host = socket.gethostbyname(socket.gethostname())
+                except OSError:
+                    container_host = None
+                if container_host and container_host != "127.0.0.1":
+                    LOG.info("Client URL (other containers): ws://%s:%d/ws", container_host, port)
+            else:
+                LOG.info("Client URL: ws://%s:%d/ws", host, port)
             try:
                 await supervise_ticks(world)
             finally:
