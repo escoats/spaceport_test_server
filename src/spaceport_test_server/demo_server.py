@@ -537,8 +537,16 @@ class DemoBazaar:
 class DemoBazaarServer:
     def __init__(self, world: DemoBazaar) -> None: self.world = world
     async def handler(self, socket: ServerConnection) -> None:
-        auth = socket.request.headers.get("Authorization", ""); token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""; station_id = next((item.spec.station_id for item in self.world.stations.values() if secrets.compare_digest(item.token, token)), None)
-        if socket.subprotocol != SUBPROTOCOL or station_id is None: await socket.close(code=1008, reason="valid Bazaar credentials and subprotocol required"); return
+        if socket.subprotocol != SUBPROTOCOL:
+            await socket.close(code=1008, reason="Bazaar subprotocol required")
+            return
+        # Selection and attachment reserve the station before any network await.
+        # Credentials deliberately have no effect on this local test server.
+        station_id = next((station_id for station_id in self.world.stations
+                           if station_id not in self.world.connections), None)
+        if station_id is None:
+            await socket.close(code=1008, reason="all stations are connected")
+            return
         try:
             session = await self.world.attach(station_id, socket)
             async for raw in socket:
