@@ -9,4 +9,4 @@ test:
 	$(PYTHON) -m pytest
 
 run:
-	$(PYTHON) -m spaceport_test_server.demo_server --scenario scenarios/default.json --host 0.0.0.0 --credential-file ./hivemind-credentials.json $(if $(MIN),--minimum-ready-stations $(MIN),)
+	$(PYTHON) -m spaceport_test_server.demo_server --scenario scenarios/default.json --host 0.0.0.0 --credential-file ./demo-credentials.json $(if $(MIN),--minimum-ready-stations $(MIN),)

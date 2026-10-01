@@ -584,7 +584,7 @@ async def run(host: str, port: int, credential_file: Path, scenario: Scenario) -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--scenario", type=Path, default=Path("scenarios/default.json")); parser.add_argument("--host", default="0.0.0.0"); parser.add_argument("--port", type=int, default=3001); parser.add_argument("--credential-file", type=Path, default=Path("hivemind-credentials.json")); parser.add_argument("--minimum-ready-stations", type=int, default=None); parser.add_argument("--verbose", action="store_true"); args = parser.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--scenario", type=Path, default=Path("scenarios/default.json")); parser.add_argument("--host", default="0.0.0.0"); parser.add_argument("--port", type=int, default=3001); parser.add_argument("--credential-file", type=Path, default=Path("demo-credentials.json")); parser.add_argument("--minimum-ready-stations", type=int, default=None); parser.add_argument("--verbose", action="store_true"); args = parser.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
     try: asyncio.run(run(args.host, args.port, args.credential_file, Scenario.from_file(args.scenario, minimum_ready_stations=args.minimum_ready_stations)))
     except (ValueError, KeyboardInterrupt) as error:
         if isinstance(error, ValueError): parser.error(str(error))
