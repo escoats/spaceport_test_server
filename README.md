@@ -18,8 +18,20 @@ spaceport-demo-server --scenario scenarios/default.json \
   --credential-file ./demo-credentials.json
 ```
 
-The server listens on `ws://127.0.0.1:3001/ws` by default. Give each client the
-generated credentials file and the `bazaar.protobuf.v2` WebSocket subprotocol.
+For a temporary startup override, pass the minimum through Make:
+
+```sh
+make run MIN=3
+```
+
+The equivalent direct command-line option is
+`--minimum-ready-stations 3`. The override takes precedence over the scenario
+value and is validated against the number of configured stations.
+
+The server listens on port `3001` on all container interfaces. When using the
+devcontainer port forwarding, connect from the host at `ws://127.0.0.1:3001/ws`.
+Give each client the freshly generated credentials file and the
+`bazaar.protobuf.v2` WebSocket subprotocol.
 
 ## Configure a scenario
 
@@ -28,6 +40,12 @@ health behavior, offer limits, and every station's identifier, specialty, and
 opening inventory. Copy it to create a repeatable test case. All resource
 bundles must name only `water`, `food`, and `components`, with non-negative
 integer amounts.
+
+Set the top-level `minimum_ready_stations` value to start after any configured
+number of stations have declared readiness. It must be between `1` and the
+number of configured stations. If omitted, it defaults to all configured
+stations, preserving the normal nine-station startup behavior. Stations that
+connect after the simulation starts can join without pausing or restarting it.
 
 This is a test server rather than a full production Bazaar implementation. It
 does not yet implement the authoritative server's complete rate-limit and error
