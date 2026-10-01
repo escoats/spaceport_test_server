@@ -1,5 +1,7 @@
 # Spaceport Bazaar Test Server
 
+[Quickstart guide](QUICKSTART.md)
+
 A deterministic local WebSocket server for exercising Spaceport Bazaar clients.
 It speaks the Bazaar v2 binary Protobuf protocol, assigns stations in connection order, waits for every station to become ready, and simulates production,
 upkeep, health, advertisements, offers, acceptances, withdrawals, expiry, and completion.
@@ -11,6 +13,14 @@ Start the server with:
 
 ```sh
 make run
+```
+
+Use `MIN=<num>` to set the minimum number of planets that must connect and
+declare readiness before the simulation starts. Use `SCENARIO=<scenario-name.json>` to select
+the scenario JSON file from `scenarios/`. You can combine both options:
+
+```sh
+make run MIN=3 SCENARIO=surplus-3-planets.json
 ```
 
 Choose a scenario from `scenarios/` by passing its JSON filename through Make:
@@ -46,8 +56,8 @@ The equivalent direct command-line option is
 `--minimum-ready-stations 3`. The override takes precedence over the scenario
 value and is validated against the number of configured stations.
 
-The server listens on port `3001` on all container interfaces. When using the
-devcontainer port forwarding, connect from the host at `ws://127.0.0.1:3001/ws`.
+After `make run`, connect using the client URL printed in the console. If the
+"same environment" URL fails, use the "other containers" URL printed there.
 Use the `bazaar.protobuf.v2` WebSocket subprotocol. No authentication is required;
 incoming credentials are ignored. Clients receive the first available station in
 scenario order through the initial snapshot’s `self_station_id`. Connections are
