@@ -100,12 +100,12 @@ async def test_tick_produces_charges_upkeep_and_finishes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_authenticated_websocket_client_receives_an_initialized_snapshot(tmp_path):
+@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer invalid"}, {"Authorization": "Basic ignored"}])
+async def test_websocket_client_receives_an_initialized_snapshot_without_authentication(tmp_path, headers):
     world = DemoBazaar(Scenario.from_file(scenario_file(tmp_path)))
     async with serve(DemoBazaarServer(world).handler, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]) as server:
         port = server.sockets[0].getsockname()[1]
-        async with connect(f"ws://127.0.0.1:{port}/ws", additional_headers={
-            "Authorization": f"Bearer {world.stations['P01'].token}"}, subprotocols=[SUBPROTOCOL]) as socket:
+        async with connect(f"ws://127.0.0.1:{port}/ws", additional_headers=headers, subprotocols=[SUBPROTOCOL]) as socket:
             message = world.pb.ServerMessage.FromString(await socket.recv())
             assert message.IsInitialized()
             assert message.WhichOneof("message") == "state"
@@ -985,3 +985,38 @@ def test_request_history_capacity_must_be_positive_integer(tmp_path, limit):
     path.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match='positive integers'):
         Scenario.from_file(path)
+
+
+async def test_connections_assign_available_stations_in_order_and_reject_overflow(worlds):
+    world = worlds()
+    server = DemoBazaarServer(world)
+    sockets = [FakeSocket() for _ in range(3)]
+    # Even a valid credential for P02 cannot select it ahead of P01.
+    sockets[0].request = SimpleNamespace(headers={
+        "Authorization": f"Bearer {world.stations['P02'].token}"})
+    handlers = []
+    try:
+        for socket, station_id in zip(sockets, ("P01", "P02")):
+            handlers.append(asyncio.create_task(server.handler(socket)))
+            assert (await received(world, socket)).state.self_station_id == station_id
+        await server.handler(sockets[2])
+        assert sockets[2].close_code == 1008
+        assert len(world.connections) == 2
+        await world.detach("P01", sockets[0])
+        replacement = FakeSocket()
+        handlers.append(asyncio.create_task(server.handler(replacement)))
+        assert (await received(world, replacement)).state.self_station_id == "P01"
+        assert not world.stations["P01"].ready
+    finally:
+        for handler in handlers:
+            handler.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
+
+
+async def test_wrong_subprotocol_does_not_claim_station(worlds):
+    world = worlds()
+    socket = FakeSocket()
+    socket.subprotocol = None
+    await DemoBazaarServer(world).handler(socket)
+    assert socket.close_code == 1008
+    assert not world.connections

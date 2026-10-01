@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import secrets
+import socket
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -536,8 +537,16 @@ class DemoBazaar:
 class DemoBazaarServer:
     def __init__(self, world: DemoBazaar) -> None: self.world = world
     async def handler(self, socket: ServerConnection) -> None:
-        auth = socket.request.headers.get("Authorization", ""); token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""; station_id = next((item.spec.station_id for item in self.world.stations.values() if secrets.compare_digest(item.token, token)), None)
-        if socket.subprotocol != SUBPROTOCOL or station_id is None: await socket.close(code=1008, reason="valid Bazaar credentials and subprotocol required"); return
+        if socket.subprotocol != SUBPROTOCOL:
+            await socket.close(code=1008, reason="Bazaar subprotocol required")
+            return
+        # Selection and attachment reserve the station before any network await.
+        # Credentials deliberately have no effect on this local test server.
+        station_id = next((station_id for station_id in self.world.stations
+                           if station_id not in self.world.connections), None)
+        if station_id is None:
+            await socket.close(code=1008, reason="all stations are connected")
+            return
         try:
             session = await self.world.attach(station_id, socket)
             async for raw in socket:
@@ -575,6 +584,17 @@ async def run(host: str, port: int, credential_file: Path, scenario: Scenario) -
     try:
         async with serve(DemoBazaarServer(world).handler, host, port, subprotocols=[SUBPROTOCOL],
                          max_size=2**20, close_timeout=world.delivery_limits.close_timeout):
+            LOG.info("WebSocket server listening on %s:%d", host, port)
+            if host in {"0.0.0.0", "::"}:
+                LOG.info("Client URL (same environment): ws://127.0.0.1:%d/ws", port)
+                try:
+                    container_host = socket.gethostbyname(socket.gethostname())
+                except OSError:
+                    container_host = None
+                if container_host and container_host != "127.0.0.1":
+                    LOG.info("Client URL (other containers): ws://%s:%d/ws", container_host, port)
+            else:
+                LOG.info("Client URL: ws://%s:%d/ws", host, port)
             try:
                 await supervise_ticks(world)
             finally:
@@ -584,7 +604,7 @@ async def run(host: str, port: int, credential_file: Path, scenario: Scenario) -
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--scenario", type=Path, default=Path("scenarios/default.json")); parser.add_argument("--host", default="0.0.0.0"); parser.add_argument("--port", type=int, default=3001); parser.add_argument("--credential-file", type=Path, default=Path("hivemind-credentials.json")); parser.add_argument("--minimum-ready-stations", type=int, default=None); parser.add_argument("--verbose", action="store_true"); args = parser.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--scenario", type=Path, default=Path("scenarios/default.json")); parser.add_argument("--host", default="0.0.0.0"); parser.add_argument("--port", type=int, default=3001); parser.add_argument("--credential-file", type=Path, default=Path("demo-credentials.json")); parser.add_argument("--minimum-ready-stations", type=int, default=None); parser.add_argument("--verbose", action="store_true"); args = parser.parse_args(); logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
     try: asyncio.run(run(args.host, args.port, args.credential_file, Scenario.from_file(args.scenario, minimum_ready_stations=args.minimum_ready_stations)))
     except (ValueError, KeyboardInterrupt) as error:
         if isinstance(error, ValueError): parser.error(str(error))

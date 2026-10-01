@@ -1,21 +1,39 @@
 # Spaceport Bazaar Test Server
 
 A deterministic local WebSocket server for exercising Spaceport Bazaar clients.
-It speaks the Bazaar v2 binary Protobuf protocol, issues temporary per-station
-bearer tokens, waits for every station to become ready, and simulates production,
+It speaks the Bazaar v2 binary Protobuf protocol, assigns stations in connection order, waits for every station to become ready, and simulates production,
 upkeep, health, advertisements, offers, acceptances, withdrawals, expiry, and completion.
 
 ## Start
 
-Requires Python 3.11 or newer. Run these commands from the project directory:
+Open the project in its dev container and wait for container setup to finish.
+Start the server with:
+
+```sh
+make run
+```
+
+Choose a scenario from `scenarios/` by passing its JSON filename through Make:
+
+```sh
+make run SCENARIO=surplus-3-planets.json
+```
+
+`SCENARIO` defaults to `default.json` in `scenarios/` and can be combined with
+`MIN`, for example `make run SCENARIO=surplus-3-planets.json MIN=3`.
+Values containing `/` are used as explicit paths, such as
+`SCENARIO=scenarios/surplus-3-planets.json` or `SCENARIO=/tmp/custom.json`.
+The equivalent direct command-line option is `--scenario <path>`.
+
+For running outside the dev container, install Python 3.11 or newer and set up
+the project first:
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 make generate
-spaceport-demo-server --scenario scenarios/default.json \
-  --credential-file ./demo-credentials.json
+make run
 ```
 
 For a temporary startup override, pass the minimum through Make:
@@ -30,8 +48,11 @@ value and is validated against the number of configured stations.
 
 The server listens on port `3001` on all container interfaces. When using the
 devcontainer port forwarding, connect from the host at `ws://127.0.0.1:3001/ws`.
-Give each client the freshly generated credentials file and the
-`bazaar.protobuf.v2` WebSocket subprotocol.
+Use the `bazaar.protobuf.v2` WebSocket subprotocol. No authentication is required;
+incoming credentials are ignored. Clients receive the first available station in
+scenario order through the initial snapshot’s `self_station_id`. Connections are
+rejected when all stations are occupied. The generated `demo-credentials.json`
+file is retained for compatibility and is optional.
 
 ## Configure a scenario
 
@@ -64,8 +85,9 @@ Command results, readiness replies, and protocol errors keep their order and are
 never coalesced. Snapshots are only replaced when no such message separates them.
 A connection is closed with WebSocket code `1013` if a send stalls for five seconds or its pending queue exceeds 64 messages or 8 MiB after snapshot coalescing. Close handshakes are limited to two seconds. Reconnect and declare readiness again to continue; retry commands with their original request IDs to recover their results.
 
-A new connection replaces the previous connection for that station. Disconnects
-reset that station's readiness but do not pause a running simulation. The server
+Disconnects free the station for the next client and reset its readiness, but do
+not pause a running simulation. Reconnecting clients receive the first available
+station, which may differ from their previous assignment. The server
 remains available for sync and reconnects after normal completion. Unexpected
 tick-task failures are logged and shut down the server instead of leaving a
 silently frozen world.
