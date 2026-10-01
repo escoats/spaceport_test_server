@@ -1,7 +1,7 @@
 {
-  "duration_ticks": 30,
-  "tick_duration_ms": 1000,
-  "economy": {"upkeep": {"water": 2, "food": 1, "components": 1}, "production_per_tick": 4, "max_health": 100, "shortage_damage_per_unit": 4, "recovery_per_fully_supplied_tick": 1, "max_offer_ttl_ticks": 3, "max_open_outgoing_offers": 1},
+  "duration_ticks": 200,
+  "tick_duration_ms": 250,
+  "economy": {"upkeep": {"water": 1, "food": 1, "components": 1}, "production_per_tick": 4, "max_health": 100, "shortage_damage_per_unit": 4, "recovery_per_fully_supplied_tick": 1, "max_offer_ttl_ticks": 3, "max_open_outgoing_offers": 1},
   "stations": [
     {"id": "P01", "specialty": "water", "inventory": {"water": 30, "food": 30, "components": 30}},
     {"id": "P02", "specialty": "food", "inventory": {"water": 30, "food": 30, "components": 30}},
