@@ -7,15 +7,22 @@ upkeep, health, advertisements, offers, acceptances, withdrawals, expiry, and co
 
 ## Start
 
-Requires Python 3.11 or newer. Run these commands from the project directory:
+Open the project in its dev container and wait for container setup to finish.
+Start the server with:
+
+```sh
+make run
+```
+
+For running outside the dev container, install Python 3.11 or newer and set up
+the project first:
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 make generate
-spaceport-demo-server --scenario scenarios/default.json \
-  --credential-file ./demo-credentials.json
+make run
 ```
 
 For a temporary startup override, pass the minimum through Make:
@@ -30,7 +37,7 @@ value and is validated against the number of configured stations.
 
 The server listens on port `3001` on all container interfaces. When using the
 devcontainer port forwarding, connect from the host at `ws://127.0.0.1:3001/ws`.
-Give each client the freshly generated credentials file and the
+Give each client the freshly generated `hivemind-credentials.json` file and the
 `bazaar.protobuf.v2` WebSocket subprotocol.
 
 ## Configure a scenario

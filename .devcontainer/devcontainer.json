@@ -3,6 +3,8 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  "remoteUser": "vscode",
+  "postCreateCommand": "python -m pip install -e '.[dev]' && make generate",
   "customizations": {
     "vscode": {
       "extensions": [
